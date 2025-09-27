@@ -1,132 +1,163 @@
-from openai import OpenAI
+from agents import Agent, Runner
 from typing import Dict, Any, List
-import datetime
-from data.doctors_database import DOCTORS_DATABASE
-from data.medicines_database import MEDICINES_DATABASE
-from data.pharmacies_database import PHARMACIES_DATABASE
+import json
 
-class HealthcareTools:
-    def __init__(self, openai_client: OpenAI):
-        self.client = openai_client
-        self.doctors = DOCTORS_DATABASE
-        self.medicines = MEDICINES_DATABASE
-        self.pharmacies = PHARMACIES_DATABASE
+from database.crud import CRUDManager
+from context.global_context import GlobalContext
+from agents.healthcare_tools import HealthcareTools
+
+class HealthcareAgent:
+    def __init__(self, db_session, openai_api_key: str, model: str = "gpt-4-1106-preview"):
+        self.db = CRUDManager(db_session)
+        self.context = None
+        self.healthcare_tools = None
+        
+        # Create the OpenAI Agent
+        self.agent = Agent(
+            name="Healthcare Assistant",
+            instructions=self._get_agent_instructions(),
+            model=model,
+            tools=[]  # Will be populated after context initialization
+        )
     
-    def schedule_appointment(self, preferred_date: str, preferred_time: str, doctor_specialization: str = None) -> Dict[str, Any]:
-        """Schedule appointment with available doctor"""
+    def _get_agent_instructions(self) -> str:
+        """Get the agent's system instructions."""
+        return """
+        You are a professional Healthcare Assistant for a multi-specialty hospital. 
+        Your role is to assist patients with medical appointments, medicine orders, 
+        and preliminary symptom guidance.
+
+        CORE RESPONSIBILITIES:
+        1. APPOINTMENT MANAGEMENT: Schedule appointments with appropriate specialists
+        2. MEDICINE SERVICES: Search and order medicines from partner pharmacies  
+        3. SYMPTOM GUIDANCE: Provide preliminary symptom analysis (with disclaimers)
+        4. DOCTOR INFORMATION: Help find suitable doctors based on specialization
+
+        PROFESSIONAL GUIDELINES:
+        - Always be empathetic, patient, and professional
+        - Never provide medical diagnoses - only guidance and recommendations
+        - For emergencies, direct to immediate medical care
+        - Verify all details before confirming appointments or orders
+        - Maintain patient confidentiality and privacy
+
+        TOOL USAGE:
+        - Use schedule_appointment for booking doctor appointments
+        - Use search_medicines for medicine price comparison
+        - Use order_medicine for placing medicine orders
+        - Use symptom_checker for preliminary symptom analysis
+        - Use find_doctors to search for specialists
+
+        Always explain what you're doing before using tools and summarize results clearly.
+        """
+    
+    def initialize_context(self, user_phone: str, user_data: Dict[str, Any] = None):
+        """Initialize user context and bind tools to agent."""
+        # Get or create user
+        user = self.db.get_user_by_phone(user_phone)
+        if not user:
+            if not user_data:
+                user_data = {"phone_number": user_phone}
+            user = self.db.create_user(user_data)
+        
+        # Initialize context
+        self.context = GlobalContext(
+            user=UserContext(
+                id=user.id,
+                phone_number=user.phone_number,
+                name=user.name,
+                address=user.address
+            ),
+            chat_history=ChatHistory()
+        )
+        
+        # Initialize tools with context
+        self.healthcare_tools = HealthcareTools(self.db, self.context)
+        
+        # Bind tools to agent
+        self.agent.tools = [
+            self.healthcare_tools.schedule_appointment,
+            self.healthcare_tools.search_medicines,
+            self.healthcare_tools.order_medicine,
+            self.healthcare_tools.symptom_checker,
+            self.healthcare_tools.find_doctors
+        ]
+    
+    def process_message(self, user_message: str) -> Dict[str, Any]:
+        """Process user message using OpenAI Agents SDK Runner."""
         try:
-            # Find available doctor
-            available_doctors = [d for d in self.doctors if not doctor_specialization or d['specialization'].lower() == doctor_specialization.lower()]
+            if not self.context:
+                return {"error": "Context not initialized. Call initialize_context() first."}
             
-            if not available_doctors:
-                return {"error": f"No {doctor_specialization or 'doctors'} available"}
+            # Add user message to chat history
+            self.context.chat_history.add_message("user", user_message)
             
-            doctor = available_doctors[0]  # Simple selection
+            # Run the agent using OpenAI Agents SDK Runner
+            result = Runner.run(
+                self.agent,
+                input=user_message,
+                additional_messages=self._get_chat_history_for_ai()
+            )
             
-            # Parse datetime
-            scheduled_time = self._parse_datetime(preferred_date, preferred_time)
-            if not scheduled_time:
-                return {"error": "Invalid date/time format. Use YYYY-MM-DD and HH:MM"}
+            # Add AI response to chat history
+            self.context.chat_history.add_message("assistant", result.final_output)
+            
+            # Save to database
+            self.db.add_chat_message({
+                "user_id": self.context.user.id,
+                "message": user_message,
+                "response": result.final_output,
+                "intent": self._detect_intent_from_result(result)
+            })
             
             return {
                 "success": True,
-                "appointment_id": len(self.doctors) + 1,  # Simple ID generation
-                "doctor_name": doctor['name'],
-                "specialization": doctor['specialization'],
-                "fee": doctor['fee'],
-                "scheduled_time": scheduled_time.isoformat(),
-                "message": f"Appointment scheduled with {doctor['name']} ({doctor['specialization']}) on {scheduled_time.strftime('%A, %B %d at %I:%M %p')}"
+                "response": result.final_output,
+                "tool_used": self._has_tool_calls(result),
+                "intent": self._detect_intent_from_result(result)
             }
+            
         except Exception as e:
-            return {"error": f"Appointment scheduling failed: {str(e)}"}
-    
-    def search_medicines(self, medicine_name: str) -> Dict[str, Any]:
-        """Search medicines in database"""
-        try:
-            found_medicines = [m for m in self.medicines if medicine_name.lower() in m['name'].lower()]
-            
-            if not found_medicines:
-                return {"error": f"Medicine '{medicine_name}' not found"}
-            
-            # Get prices from pharmacies
-            medicine_prices = []
-            for pharmacy in self.pharmacies:
-                price = len(medicine_name) * 10 + len(pharmacy['name'])  # Simple price calculation
-                medicine_prices.append({
-                    "pharmacy": pharmacy['name'],
-                    "price": price,
-                    "delivery_time": pharmacy['delivery_time'],
-                    "contact": pharmacy['phone']
-                })
-            
+            error_msg = "I apologize, but I'm experiencing technical difficulties. Please try again."
             return {
-                "success": True,
-                "medicines": found_medicines,
-                "prices": medicine_prices,
-                "best_option": min(medicine_prices, key=lambda x: x['price'])
+                "success": False,
+                "response": error_msg,
+                "error": str(e)
             }
-        except Exception as e:
-            return {"error": f"Medicine search failed: {str(e)}"}
     
-    def order_medicine(self, medicine_name: str, pharmacy_id: int, quantity: int = 1) -> Dict[str, Any]:
-        """Place medicine order"""
-        try:
-            pharmacy = next((p for p in self.pharmacies if p['id'] == pharmacy_id), None)
-            if not pharmacy:
-                return {"error": "Pharmacy not found"}
-            
-            medicine = next((m for m in self.medicines if medicine_name.lower() in m['name'].lower()), None)
-            if not medicine:
-                return {"error": "Medicine not found"}
-            
-            price = len(medicine_name) * 10 * quantity
-            
-            return {
-                "success": True,
-                "order_id": len(self.pharmacies) + 1,
-                "medicine": medicine['name'],
-                "pharmacy": pharmacy['name'],
-                "quantity": quantity,
-                "total_amount": price,
-                "delivery_time": pharmacy['delivery_time'],
-                "contact": pharmacy['phone'],
-                "message": f"Order placed for {quantity} {medicine['name']} with {pharmacy['name']}"
-            }
-        except Exception as e:
-            return {"error": f"Order failed: {str(e)}"}
+    def _get_chat_history_for_ai(self) -> List[Dict[str, str]]:
+        """Convert chat history to format expected by OpenAI API."""
+        messages = []
+        for msg in self.context.chat_history.get_recent_messages(6):  # Last 6 messages
+            messages.append({
+                "role": "user" if msg.role == "user" else "assistant",
+                "content": msg.content
+            })
+        return messages
     
-    def symptom_checker(self, symptoms: List[str], age: int) -> Dict[str, Any]:
-        """Basic symptom analysis"""
-        try:
-            symptoms_text = ", ".join(symptoms).lower()
-            
-            # Simple symptom analysis
-            if any(s in symptoms_text for s in ['fever', 'cough', 'cold']):
-                analysis = "Possible viral infection or common cold"
-                recommendation = "Rest, hydrate, take paracetamol if needed"
-            elif any(s in symptoms_text for s in ['headache', 'migraine']):
-                analysis = "Tension headache or migraine"
-                recommendation = "Rest in quiet room, avoid bright lights"
-            else:
-                analysis = "General symptoms observed"
-                recommendation = "Monitor symptoms and consult doctor if persistent"
-            
-            return {
-                "success": True,
-                "analysis": analysis,
-                "recommendation": recommendation,
-                "urgency": "Non-emergency",
-                "advice": "Consult doctor if symptoms worsen"
-            }
-        except Exception as e:
-            return {"error": f"Symptom analysis failed: {str(e)}"}
+    def _has_tool_calls(self, result) -> bool:
+        """Check if the result involved tool calls."""
+        return hasattr(result, 'steps') and any(
+            hasattr(step, 'tool_calls') and step.tool_calls 
+            for step in result.steps
+        )
     
-    def _parse_datetime(self, date_str: str, time_str: str) -> datetime.datetime:
-        """Parse datetime from strings"""
-        try:
-            return datetime.datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-        except:
-            try:
-                return datetime.datetime.strptime(f"{date_str} {time_str}", "%d/%m/%Y %H:%M")
-            except:
-                return datetime.datetime.now() + datetime.timedelta(days=1)
+    def _detect_intent_from_result(self, result) -> str:
+        """Detect intent from the agent's tool usage."""
+        if not self._has_tool_calls(result):
+            return "general_inquiry"
+        
+        # Map tool names to intents
+        tool_intent_map = {
+            "schedule_appointment": "appointment_booking",
+            "search_medicines": "medicine_search", 
+            "order_medicine": "medicine_order",
+            "symptom_checker": "symptom_analysis",
+            "find_doctors": "doctor_search"
+        }
+        
+        for step in result.steps:
+            if hasattr(step, 'tool_calls') and step.tool_calls:
+                tool_name = step.tool_calls[0].name
+                return tool_intent_map.get(tool_name, "general_inquiry")
+        
+        return "general_inquiry"
